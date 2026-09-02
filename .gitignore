@@ -1,0 +1,18 @@
+# 构建产物（源码仓库不入库）
+zhengli.exe
+zhengli-arm64
+zhengli.new.exe
+
+# 运行时数据（用户数据，不入库）
+zhengli.db
+zhengli.db-journal
+uploads/
+
+# 前端依赖与构建产物（go:embed 前先执行 npm run build）
+web/node_modules/
+web/.npm-cache/
+web/dist/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db

@@ -1,0 +1,253 @@
+# 家庭收纳位置管理系统｜完整最终需求规格说明书
+## 文档目的
+构建「房间‑容器‑物品」数据模型，还原真实房间物理尺寸布局，支持3D可视化调整收纳布局；记录物品存放归属关系；支持多房间。
+> 单位统一：全部长度单位：**米(m)**
+> 坐标系定义：
+> - X‑Z：地面平面；Y：竖直向上；
+> - 数据库存储 `x/y/z`：物体**中心点坐标**
+> - `w` X向宽度；`d` Z向深度；`h` Y向高度；`rot_y` 绕竖直Y轴旋转（弧度）
+>
+> 核心两套逻辑完全解耦：
+> 1. **业务收纳归属(parent_id)**：语义：**放置于XX内部 / 固定附属在XX台面之上**；用于物品收纳归属；全局硬约束：**嵌套最大深度3层**；`parent_id IS NULL / 0` 为根节点 depth=0；depth=3 的容器禁止创建任何子容器。
+> 2. **空间几何坐标(x/y/z/w/h/d/rot_y)**：物理摆放位置大小；仅用于3D布局预览拖拽；**系统不校验坐标与parent_id一致性**，允许几何位置和业务归属不一致，由用户保证数据一致性。
+>
+> 重要区分：
+> - 几何堆叠重叠 ≠ parent_id父子关系；仅摞在盖子顶面堆放，没有装入内部，`parent_id=null`，只修改Y坐标抬高。
+> - `table`类型的子容器语义永远是**放在台面之上**；台面下方物体即使几何嵌套在桌子内部，不能设置parent_id指向table。
+
+## 一、数据库表结构
+### 1.1 rooms 房间表
+```sql
+CREATE TABLE IF NOT EXISTS rooms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    room_w REAL,     --房间X方向总宽度
+    room_d REAL,     --房间Z方向总深度
+    room_h REAL      --房间层高（天花板高度）
+);
+```
+
+### 1.2 locations 容器/家具/障碍物/可用区域表
+柜子、箱子、台面、隔板、床、空调、晾衣绳、局部可用地面区域全部存储在此表
+```sql
+CREATE TABLE IF NOT EXISTS locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    parent_id INTEGER REFERENCES locations(id),
+    name TEXT NOT NULL,
+    location_type TEXT NOT NULL,
+    x REAL DEFAULT 0,
+    y REAL DEFAULT 0,
+    z REAL DEFAULT 0,
+    w REAL DEFAULT 0.2,
+    h REAL DEFAULT 0.2,
+    d REAL DEFAULT 0.2,
+    rot_y REAL DEFAULT 0,
+    color TEXT DEFAULT "#cccccc",
+    is_activity_zone INTEGER DEFAULT 0,
+    is_cardbox INTEGER DEFAULT 0
+);
+```
+
+### 1.3 items 物品表
+物品无3D几何尺寸，只归属到location
+```sql
+CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    remark TEXT,
+    qty INTEGER DEFAULT 1
+);
+```
+
+## 二、location_type 完整枚举与权限矩阵
+|类型|说明|允许子容器|允许存放item物品|特殊说明|
+|---|---|---|---|---|
+|cabinet|柜子本体（衣柜、储物柜）|✅允许|✅允许|内部隔间/箱子作为子节点；柜子外部顶面使用独立`table`平级，不作为柜子子节点|
+|drawer|抽拉抽屉 / 柜子隔板隔间|✅允许|✅允许|真实抽屉、柜子内部隔板隔间复用此类型|
+|shelf_layer|置物架单层板|✅允许|✅允许|每层独立顶层；盒子放板上设置parent_id为本层ID；桌下置物板也使用该类型|
+|box|收纳箱、收纳盒|✅允许|✅允许|箱子内部放子容器计入嵌套；摞在盖子顶面使用坐标平级|
+|cardbox|纸箱|✅允许|✅允许|is_cardbox=1标记纸箱；可顶层可子容器|
+|luggage|行李箱|✅允许|✅允许|地面摆放parent_id=null；顶面可放置子容器|
+|wall_mount|墙上悬挂收纳容器：挂篮、挂墙盒|✅允许|✅允许|几何坐标贴墙摆放，可以存放收纳物品|
+|table|水平台面：书桌、床头柜台面、衣柜‑顶面|✅允许|✅允许|parent_id指向table代表容器放在**台面之上**；台面下方物体parent_id=null|
+|hanger|落地衣架|❌禁止|✅允许|仅用于挂衣物；禁止挂载任何子容器|
+|tray|活动托盘|❌禁止|❌禁止|同一个room_id最多1条；is_activity_zone=1；禁止存放item物品|
+|ground_spot|局部地面可用点位：床底、桌下局部空隙|❌禁止|✅允许|标记一块可用摆放的地面几何区域；用户按需新建；渲染薄半透方块；禁止子容器；容器箱子不能把parent_id指向它，箱子保持顶层仅坐标落在区域内|
+|furniture|床|❌禁止|❌禁止|仅3D渲染方块；不能存放物品item；不能作为任何容器的parent_id|
+|obstacle|障碍物：空调、晾衣绳、横梁、管道、桌腿支撑|❌禁止|❌禁止|仅空间占位渲染；禁止存放物品item；禁止作为父容器；parent_id必须为null|
+
+## 三、后端核心校验逻辑（创建/更新 location 必执行）
+### 3.1 获取容器向上递归深度函数
+根节点 parent_id=0/null → depth=0
+```go
+func getDepth(locID int)(int,error){
+	depth :=0
+	for locID !=0 {
+		loc,err := queryLocation(locID)
+		if err != nil {
+			return 0,err
+		}
+		if loc.ParentID == nil || *loc.ParentID ==0 {
+			break
+		}
+		depth++
+		locID = *loc.ParentID
+	}
+	return depth,nil
+}
+```
+
+### 3.2 保存 location 完整校验清单
+1. 父容器类型不允许子容器 → 返回错误：`该类型不支持添加子容器`。
+2. `parentDepth,_ := getDepth(parentID)`；`newTotalDepth = parentDepth + 1`。若 `newTotalDepth >3` → 返回错误：`系统限制，嵌套层级最多3层`。
+3. 保存后深度等于3：UI隐藏新建子容器按钮，后端接口依旧兜底拦截新增子容器。
+4. 业务特殊约束：
+    - `tray`：同一room_id最多仅存在一条记录；禁止item归属。
+    - `ground_spot`：禁止其他location把parent_id指向它。
+    - `furniture`：禁止作为parent_id；禁止item.location_id指向该记录。
+    - `obstacle`：parent_id必须为null；禁止item归属；禁止子容器。
+5. 系统不会自动生成任何location；ground_spot全部由用户手动新建。
+6. **不校验几何坐标与parent_id匹配关系，允许子容器方块不在父容器几何内部**。
+
+## 四、现实物理场景‑数据模型映射表
+|现实物理场景|数据模型处理|
+|---|---|
+|柜子内部隔板隔间|新建drawer；parent_id=cabinet.id；坐标放在柜子方块内部|
+|箱子直接放在柜子内部大空间|box，parent_id=cabinet.id|
+|箱子放在柜子内部隔间里面|box，parent_id=drawer.id|
+|柜子外部顶面放箱子|新建独立`衣柜‑顶面(table)` parent_id=null；箱子parent_id=衣柜‑顶面ID|
+|柜子顶上摞多个箱子（摞盖子顶面，不是装入内部）|底层箱子parent_id=衣柜‑顶面ID；其余箱子parent_id=null，仅抬高y坐标视觉堆叠|
+|箱子内部装盒子|盒子parent_id=箱子ID，计入嵌套深度，上限depth=3|
+|箱子盖子顶面摞另一个箱子（堆放）|摞放箱子parent_id=null，仅抬高y坐标|
+|收纳盒放在置物架层板之上|box parent_id = shelf_layer.id|
+|物品裸放桌面（无容器）|item.location_id = table.id；不新增location，不占用嵌套层级|
+|容器盒子放在桌面上|box parent_id=table.id；depth=1计入嵌套|
+|桌子下方自带可以置物横向隔板|新建`shelf_layer` parent_id=null；坐标布置在桌子几何内部下方；板子上容器parent_id指向该shelf_layer|
+|桌子下方只有支撑横梁桌腿，不能放东西|`obstacle`障碍物 parent_id=null|
+|桌下桌腿挡住两边，只有中间地面空隙可用|可用区 `ground_spot`；遮挡桌腿`obstacle`；箱子box parent_id=null，坐标落在ground_spot范围内|
+|床底被横梁分割，分段狭长可用空隙|每一段可用空隙各建一个`ground_spot`；横梁使用`obstacle`；箱子parent_id=null，坐落在可用区坐标内|
+|柜子底部有踢脚底座挡两边，中间有空隙|中间可用`ground_spot`；底座结构`obstacle`；箱子parent_id=null|
+|纸箱放在桌子下方地面|cardbox parent_id=null；坐标放到桌子下方|
+|行李箱摆地面|luggage parent_id=null；顶面可以放子容器|
+|物品裸放床底下地面|新建`ground_spot`；item.location_id指向该点位|
+|纸箱摆床底下地面|cardbox parent_id=null，坐标摆床底，不是ground_spot子容器|
+|墙上挂收纳挂篮（可放杂物）|wall_mount parent_id=null；内部可以放子容器|
+|壁挂空调、晾衣绳、横梁、管道|obstacle parent_id=null；半透明占位渲染|
+|床头柜|两条顶层location：`床头柜‑桌面(table)`、`床头柜‑抽屉(drawer)`|
+|活动托盘放在桌面之上|tray parent_id=table.id；同房间最多1，禁止存放物品|
+|床|furniture；仅渲染方块，不能存放，不能作为父容器|
+
+## 五、UI / 3D视图需求
+1. 渲染房间空心墙体轮廓，尺寸标尺，单位米。
+2. 每条location渲染立方体；不同location_type区分颜色；
+    - ground_spot：半透淡绿色薄方块，标记可用摆放区域；
+    - obstacle：半透灰色方块，标记空间阻挡区域。
+3. 3D交互能力：
+    - 拖拽方块修改 X/Z；上下拖拽修改Y；缩放修改w/h/d；旋转修改rot_y。
+    - 点击方块打开详情面板：编辑名称、类型、parent_id、全部尺寸坐标；查看直属物品列表、直属子容器列表。
+    - 面包屑导航展示**业务归属parent_id链路**，不依靠3D空间位置推导收纳归属。
+4. 物品item不在3D场景渲染，仅列表展示。
+5. 拖拽布局警告提示（仅UI提示，不强制拦截保存）
+    - 方块与obstacle重叠：黄色警告「与障碍物空间重叠」
+    - 方块不在任何可用区域内：灰色弱提示「该位置未标记可用空间」
+6. UI层面：深度等于3的容器，隐藏新建子容器按钮。
+7. 导出能力：房间布局快照导出；全量物品清单导出；locations完整CSV导出。
+
+## 六、初始化快速采集方案
+> 两种初始化模式：【业务优先草图模式】、【实测精准建模模式】
+### 模式A：草图快速初始化（先业务，后几何）
+1. 创建房间。
+2. CSV批量导入locations：只填写 `name、room_id、location_type、parent_id`；尺寸坐标使用默认值。
+3. CSV批量导入items，完成物品归属。
+4. 业务收纳树完整；3D布局错乱；碎片时间逐个补录尺寸坐标。
+
+### 模式B：实测精准初始化（完整还原3D布局）
+> 用户现实测量习惯：测量物体**墙角偏移、底部离地高度**，**UI/导入层自动换算中心点x/y/z**，用户不手动输入中心点。
+> 换算公式：
+> ```
+> centerX = cornerX + w / 2
+> centerZ = cornerZ + d / 2
+> centerY = bottomY + h / 2
+> rot_y = rad(rot_y_deg)
+> ```
+
+### CSV批量导入（核心初始化手段）
+支持三套csv：`rooms.csv`、`locations.csv`、`items.csv`
+locations导入支持两套输入：
+1. 直接数据库字段：`x,y,z,w,h,d,rot_y`
+2. 简易采集字段（仅导入解析，不入库）：`corner_x、corner_z、bottom_y、rot_y_deg`
+> 导入逻辑：
+> - 如果填写简易采集字段，则自动换算中心点；
+> - 如果提供x/y/z优先使用直接中心点；
+> - 导入完整执行后端全部location校验；错误返回行号+错误信息；支持增量新增、按ID更新；支持清空房间重导入。
+
+#### locations.csv 表头模板
+```csv
+name,room_id,location_type,parent_id,corner_x,corner_z,bottom_y,w,d,h,rot_y_deg,color,is_cardbox
+```
+
+#### rooms.csv 表头模板
+```csv
+name,room_w,room_d,room_h
+```
+
+#### items.csv 表头模板
+```csv
+name,location_id,qty,remark
+```
+
+## 七、合法样例树综合演示
+```
+房间 depth0
+├─obstacle‑壁挂空调(obstacle) depth0
+├─obstacle‑室内晾衣绳(obstacle) depth0
+├─衣柜(cabinet) depth0
+│  ├─衣柜‑左上隔间(drawer) depth1
+│  │  └─收纳盒‑A(box) depth2
+│  │     └─分装小盒‑A1(box) depth3 ✅禁止子容器
+│  └─柜内‑大收纳箱(box) depth1
+│     └─中盒‑C(box) depth2
+│        └─小盒‑D(box) depth3 ✅禁止子容器
+├─衣柜‑顶面(table) depth0
+│  └─顶层‑大箱子A(box) depth1
+│     └─中层‑箱子B(box) depth2
+│        └─内层‑小箱子C(box) depth3 ✅禁止子容器
+├─箱子‑D(box) #摞在C箱子顶面，parent_id=null，仅y抬高
+├─书桌(table) depth0
+│  └─桌面收纳盒A(box) depth1
+├─桌下‑横向置物隔板(shelf_layer) depth0
+│  └─桌下收纳盒B(box) depth1
+│     └─小盒C(box) depth2
+│        └─迷你盒D(box) depth3 ✅禁止子容器
+├─桌下‑左侧桌腿(obstacle) depth0
+├─桌下‑右侧桌腿(obstacle) depth0
+├─桌下‑中间可用区(ground_spot) depth0
+├─桌下‑收纳箱E(box) depth0
+├─床(furniture) depth0
+└─床底‑中间可用空隙(ground_spot) depth0
+```
+
+## 八、系统红线禁止规则
+1. ❌业务嵌套深度超过3层，后端硬拦截保存。
+2. ❌`furniture`床不能存放物品，不能作为parent_id。
+3. ❌`tray`活动托盘不能存放物品；每个房间最多1条。
+4. ❌`ground_spot`地面点位不允许创建子容器；箱子不能将parent_id指向ground_spot。
+5. ❌`hanger`衣架不允许挂载任何子容器。
+6. ❌`obstacle`障碍物parent_id必须为null；禁止存放物品、禁止子容器。
+7. ❌`table`的子容器语义永远是**台面之上**；桌下物体即使几何嵌套桌子内部，不能设置parent_id指向table。
+8. ❌柜子外部顶面必须独立table平级，不能作为cabinet的子节点。
+9. ❌几何坐标重叠不等于业务父子关系；只有装入内部 / 固定附属台面之上，才填写parent_id。
+10. ❌系统不会自动生成任何location；房间、可用地面区域全部由用户手动维护。
+11. ❌不强制校验坐标与parent_id匹配关系。
+
+## 九、业务工作流
+1. 创建房间，录入房间物理尺寸。
+2. 创建/导入locations：填写名称、类型；填写测量尺寸与位置；设置parent_id建立收纳归属，后端校验嵌套规则。
+3. 录入/导入items物品，归属对应location。
+4. 布局调整：拖拽修改几何坐标尺寸（仅改变摆放位置）。
+5. 收纳挪动：修改parent_id（仅改变业务归属关系）；两者操作互相独立，可以分开完成。
+6. 查询：查询直属子容器；递归查询全部下级容器；查询容器下全部物品清单。
+
+如果你下一步需要，我可以继续输出REST API接口清单（请求响应示例）。
